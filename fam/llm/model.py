@@ -8,6 +8,7 @@ import torch.nn as nn
 import tqdm
 from einops import rearrange
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
 from fam.llm.layers import Block, LayerNorm, RMSNorm
 from fam.llm.mixins import CausalInferenceMixin, NonCausalInferenceMixin
@@ -44,6 +45,7 @@ class GPTConfig:
     swiglu_multiple_of: Optional[int] = None  # MLP hidden layer (using SwiGLU) will be multiple of this
     attn_kernel_type: Literal["torch_attn"] = "torch_attn"
     kv_cache_enabled: bool = False  # whether to use key-value cache for attention
+    gradient_checkpointing: bool = False  # Added gradient_checkpointing flag
 
 
 def _check_speaker_emb_dims(
@@ -279,7 +281,11 @@ class GPT(nn.Module, NonCausalInferenceMixin, CausalInferenceMixin):
 
         x = self.transformer.drop(tok_emb + pos_emb + spk_emb)
         for block in self.transformer.h:
-            x = block(x)
+            # Apply activation checkpointing
+            if self.training and self.config.gradient_checkpointing:
+                x = activation_checkpoint(block, x)
+            else:
+                x = block(x)
         x = self.transformer.ln_f(x)
 
         if targets is not None:

@@ -13,6 +13,7 @@ import torch
 from huggingface_hub import snapshot_download
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
 from fam.llm.config.finetune_params import *
 from fam.llm.loaders.training_data import DynamicComputeDataset
@@ -26,9 +27,7 @@ from fam.telemetry.posthog import PosthogClient
 # see fam/telemetry/README.md for more information
 posthog = PosthogClient()
 
-dtype: Literal["bfloat16", "float16", "tfloat32", "float32"] = (
-    "bfloat16" if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else "float16"
-)  # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
+dtype: Literal["bfloat16", "float16", "tfloat32", "float32"] = "float16"
 seed_offset = 0
 
 torch.manual_seed(seed + seed_offset)
@@ -39,7 +38,7 @@ device_type = "cuda" if "cuda" in device else "cpu"  # for later use in torch.au
 ptdtype = {"float32": torch.float32, "tfloat32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}[
     dtype
 ]
-ctx = nullcontext() if device_type == "cpu" else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+ctx = nullcontext() if device_type == "cpu" else torch.amp.autocast(device_type=device_type, dtype=torch.float16)
 
 print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
@@ -130,7 +129,7 @@ def main(train: Path, val: Path, model_id: str, ckpt: Optional[Path], spk_emb_ck
     mode_params = get_params_for_mode(audio_token_mode, num_max_audio_tokens_timesteps=num_max_audio_tokens_timesteps)
     config = get_globals_state()
 
-    checkpoint = torch.load(str(checkpoint_path), mmap=True, map_location=device)
+    checkpoint = torch.load(str(checkpoint_path), mmap=True, map_location="cpu")
     iter_num = checkpoint.get("iter_num", 0)
     best_val_loss = checkpoint.get("best_val_loss", 1e9)
     checkpoint_model_args = checkpoint["model_args"]
@@ -297,9 +296,8 @@ def main(train: Path, val: Path, model_id: str, ckpt: Optional[Path], spk_emb_ck
 
                 save_checkpoint = save_checkpoint or iter_num % save_interval == 0
                 if save_checkpoint and iter_num > 0:
-                    checkpoint = {
+                    checkpoint_data = {
                         "model": raw_model.state_dict(),  # type: ignore
-                        "optimizer": optimizer.state_dict(),
                         "model_args": model_args,
                         "iter_num": iter_num,
                         "best_val_loss": best_val_loss,
@@ -310,7 +308,7 @@ def main(train: Path, val: Path, model_id: str, ckpt: Optional[Path], spk_emb_ck
                             "tokenizer": tokenizer_info,
                         },
                     }
-                    torch.save(checkpoint, os.path.join(ckpts_save_dir, ckpt_save_name))
+                    torch.save(checkpoint_data, os.path.join(ckpts_save_dir, ckpt_save_name))
                     print(f"saving checkpoint to {ckpts_save_dir}")
                     save_checkpoint = False
             if iter_num == 0 and eval_only:

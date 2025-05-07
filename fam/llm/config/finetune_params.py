@@ -4,8 +4,9 @@ import uuid
 import pathlib
 from typing import Literal, Optional
 import torch
+import torch.quantization
 
-batch_size = 2
+batch_size = 1
 dataset_size: int = 400
 batched_ds_size = dataset_size // batch_size
 val_train_ratio = 0.2
@@ -32,7 +33,7 @@ wandb_project = "project-name"
 wandb_run_name = "run-name"
 wandb_tags = ["tag1", "tag2"]
 
-gradient_accumulation_steps = 1
+gradient_accumulation_steps = 4
 block_size = 2_048
 audio_token_mode = "flattened_interleaved"
 num_max_audio_tokens_timesteps = 1_024
@@ -70,3 +71,7 @@ tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * bl
 causal = True
 bias: bool = False  # do we use bias inside LayerNorm and Linear layers?
 spk_emb_on_text: bool = True  # whether to add speaker embedding conditioning to text tokens or not
+
+# Enable mixed precision training
+# Ensure that the dtype is set to float16 or bfloat16 in the finetune.py file
+gradient_checkpointing = True # Added for activation checkpointing
