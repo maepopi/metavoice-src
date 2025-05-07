@@ -186,3 +186,8 @@ cython_debug/
 #.idea/
 **/.tmp
 !fam/quantiser/audio/speaker_encoder/ckpt/ckpt.pt
+
+
+*.wav
+*.mp3
+*.csv
