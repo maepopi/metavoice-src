@@ -90,7 +90,7 @@ class SpeakerEncoder(nn.Module):
 
         mel = audio.wav_to_mel_spectrogram(wav)
         mels = np.array([mel[s] for s in mel_slices])
-        mels = torch.from_numpy(mels).to(self.device)  # type: ignore
+        mels = torch.from_numpy(mels).to(device=self.device, dtype=self.lstm.weight_ih_l0.dtype)  # Match LSTM dtype
         with torch.no_grad():
             partial_embeds = self(mels)
 
