@@ -238,7 +238,7 @@ def _load_model(
 ):
     ##### MODEL
     with torch.device("meta"):
-        model = Transformer.from_name("metavoice-1B")
+        model = Transformer.from_name("metavoice-1B", dtype_override=precision)
 
     checkpoint = torch.load(str(checkpoint_path), mmap=True, weights_only=False)
     state_dict = checkpoint["model"]
@@ -278,7 +278,16 @@ def _load_model(
             k = k.replace(".mlp.c_proj.", ".feed_forward.w2.")
 
     model.load_state_dict(state_dict, assign=True)
-    model = model.to(device=device, dtype=torch.bfloat16)
+
+    # First, ensure the model is in the target precision on the CPU
+    if precision == torch.float16:
+        model = model.float() # Convert to float32 then to float16 for safety if needed, or directly model.half()
+    elif precision == torch.bfloat16:
+        model = model.bfloat16()
+    # Add other precision handling if necessary, though we are focused on float16
+
+    # Then, move the precision-corrected model to the target device
+    model = model.to(device=device)
 
     if quantisation_mode == "int8":
         warnings.warn(
@@ -291,7 +300,12 @@ def _load_model(
         quantized_state_dict = simple_quantizer.create_quantized_state_dict()
         model = simple_quantizer.convert_for_runtime()
         model.load_state_dict(quantized_state_dict, assign=True)
-        model = model.to(device=device, dtype=torch.bfloat16)
+        # Ensure precision after quantization as well, then move to device
+        if precision == torch.float16:
+            model = model.float().half() # Or model.half()
+        elif precision == torch.bfloat16:
+            model = model.bfloat16()
+        model = model.to(device=device)
         # TODO: int8/int4 doesn't decrease VRAM usage substantially... fix that (might be linked to kv-cache)
         torch.cuda.empty_cache()
     elif quantisation_mode == "int4":
@@ -302,7 +316,21 @@ def _load_model(
         quantized_state_dict = simple_quantizer.create_quantized_state_dict()
         model = simple_quantizer.convert_for_runtime(use_cuda=True)
         model.load_state_dict(quantized_state_dict, assign=True)
-        model = model.to(device=device, dtype=torch.bfloat16)
+        # If use_cuda=True moved it, this .to(device) might be redundant or just a dtype conversion
+        # If it's already on GPU, ensure correct dtype
+        if str(model.device) == device: # Check if already on target device
+            if precision == torch.float16 and model.dtype != torch.float16:
+                model = model.half()
+            elif precision == torch.bfloat16 and model.dtype != torch.bfloat16:
+                model = model.bfloat16()
+            # else, it's already on device with correct dtype (less likely for int4 path)
+        else: # Not on device OR use_cuda=False (though it's True here)
+            if precision == torch.float16:
+                model = model.float().half()
+            elif precision == torch.bfloat16:
+                model = model.bfloat16()
+            model = model.to(device=device)
+
         torch.cuda.empty_cache()
     elif quantisation_mode is not None:
         raise Exception(f"Invalid quantisation mode {quantisation_mode}! Must be either 'int4' or 'int8'!")
@@ -318,6 +346,7 @@ def _load_model(
         eval=True,
         verbose=False,
     )
+    smodel = smodel.to(dtype=precision)
     return model.eval(), tokenizer, smodel
 
 

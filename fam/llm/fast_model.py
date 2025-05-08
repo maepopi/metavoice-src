@@ -15,7 +15,7 @@
 # may be used to endorse or promote products derived from this software without
 # specific prior written permission.
 #
-# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS “AS IS” AND ANY EXPRESS OR
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR
 # IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
 # FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR
 # CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
@@ -61,7 +61,7 @@ class ModelArgs:
     n_local_heads: int = -1
     head_dim: int = 64
     norm_eps: float = 1e-5
-    dtype: torch.dtype = torch.bfloat16
+    dtype: Optional[torch.dtype] = None
 
     def __post_init__(self):
         if self.n_local_heads == -1:
@@ -72,16 +72,25 @@ class ModelArgs:
             self.intermediate_size = find_multiple(n_hidden, 256)
         self.head_dim = self.dim // self.n_head
 
-        self.dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16}[get_default_dtype()]
+        if self.dtype is None:
+            self.dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16}[get_default_dtype()]
+        elif isinstance(self.dtype, str):
+            self.dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16}.get(self.dtype, torch.bfloat16)
 
     @classmethod
-    def from_name(cls, name: str):
+    def from_name(cls, name: str, dtype_override: Optional[torch.dtype] = None):
+        config_params = {}
         if name in transformer_configs:
-            return cls(**transformer_configs[name])
-        # fuzzy search
-        config = [config for config in transformer_configs if config in str(name).upper() or config in str(name)]
-        assert len(config) == 1, name
-        return cls(**transformer_configs[config[0]])
+            config_params = transformer_configs[name]
+        else:
+            config_match = [config_key for config_key in transformer_configs if config_key in str(name).upper() or config_key in str(name)]
+            assert len(config_match) == 1, f"Model name {name} not found or ambiguous in configs."
+            config_params = transformer_configs[config_match[0]]
+        
+        if dtype_override is not None:
+            config_params['dtype'] = dtype_override
+            
+        return cls(**config_params)
 
 
 transformer_configs = {
@@ -101,15 +110,15 @@ class KVCache(nn.Module):
         self.register_buffer("k_cache", torch.zeros(cache_shape, dtype=dtype))
         self.register_buffer("v_cache", torch.zeros(cache_shape, dtype=dtype))
 
-    def update(self, input_pos, k_val, v_val):
-        # input_pos: [S], k_val: [B, H, S, D]
-        assert input_pos.shape[0] == k_val.shape[2]
-
+    def update(self, input_pos: Tensor, k_val: Tensor, v_val: Tensor) -> Tuple[Tensor, Tensor]:
+        # Ensure input tensors have the same dtype as the cache
+        k_val = k_val.to(dtype=self.k_cache.dtype)
+        v_val = v_val.to(dtype=self.v_cache.dtype)
+        
         k_out = self.k_cache
         v_out = self.v_cache
         k_out[:, :, input_pos] = k_val
         v_out[:, :, input_pos] = v_val
-
         return k_out, v_out
 
 
@@ -149,6 +158,8 @@ class Transformer(nn.Module):
 
     def forward(self, idx: Tensor, spk_emb: Tensor, input_pos: Tensor) -> Tensor:
         mask = self.causal_mask[None, None, input_pos]
+        # Ensure consistent dtype
+        spk_emb = spk_emb.to(dtype=self.tok_embeddings.weight.dtype)
         x = (
             self.tok_embeddings(idx)
             + self.pos_embeddings(input_pos)
@@ -158,13 +169,14 @@ class Transformer(nn.Module):
 
         for i, layer in enumerate(self.layers):
             x = layer(x, input_pos, mask)
+
         x = self.norm(x)
         logits = self.output(x)
         return logits
 
     @classmethod
-    def from_name(cls, name: str):
-        return cls(ModelArgs.from_name(name))
+    def from_name(cls, name: str, dtype_override: Optional[torch.dtype] = None):
+        return cls(ModelArgs.from_name(name, dtype_override=dtype_override))
 
 
 class TransformerBlock(nn.Module):
@@ -176,7 +188,7 @@ class TransformerBlock(nn.Module):
         self.attention_norm = RMSNorm(config.dim, config.norm_eps)
 
     def forward(self, x: Tensor, input_pos: Tensor, mask: Tensor) -> Tensor:
-        h = x + self.attention(self.attention_norm(x), mask, input_pos)
+        h = x + self.attention(self.attention_norm(x), input_pos, mask)
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
 
@@ -200,8 +212,8 @@ class Attention(nn.Module):
     def forward(
         self,
         x: Tensor,
+        input_pos: Tensor,
         mask: Tensor,
-        input_pos: Optional[Tensor] = None,
     ) -> Tensor:
         bsz, seqlen, _ = x.shape
 
@@ -212,13 +224,26 @@ class Attention(nn.Module):
         k = k.view(bsz, seqlen, self.n_local_heads, self.head_dim)
         v = v.view(bsz, seqlen, self.n_local_heads, self.head_dim)
 
-        q, k, v = map(lambda x: x.transpose(1, 2), (q, k, v))
+        q = q.transpose(1, 2)  # (bsz, n_head, seqlen, head_dim)
+        k = k.transpose(1, 2)  # (bsz, n_local_heads, cache_len + seqlen, head_dim)
+        v = v.transpose(1, 2)  # (bsz, n_local_heads, cache_len + seqlen, head_dim)
 
-        if self.kv_cache is not None:
+        # Ensure all tensors have the same dtype as the input
+        target_dtype = x.dtype
+        q = q.to(target_dtype)
+        k = k.to(target_dtype)
+        v = v.to(target_dtype)
+
+        if self.kv_cache is not None and input_pos is not None:
             k, v = self.kv_cache.update(input_pos, k, v)
 
         k = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
         v = v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
+        
+        # Ensure k and v maintain the same dtype after repeat_interleave
+        k = k.to(target_dtype)
+        v = v.to(target_dtype)
+        
         y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
 
         y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)

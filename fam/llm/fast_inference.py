@@ -66,7 +66,8 @@ class TTS:
 
         # NOTE: this needs to come first so that we don't change global state when we want to use
         # the torch.compiled-model.
-        self._dtype = get_default_dtype()
+        self._dtype = "float16"
+        print(f"Forcing dtype to: {self._dtype}")
         self._device = get_device()
         self._model_dir = snapshot_download(repo_id=model_name)
         self.first_stage_adapter = FlattenedInterleavedEncodec2Codebook(end_of_audio_token=self.END_OF_AUDIO_TOKEN)
@@ -94,13 +95,14 @@ class TTS:
         self.enhancer = get_enhancer("df")
 
         self.precision = {"float16": torch.float16, "bfloat16": torch.bfloat16}[self._dtype]
+        print(f"Using precision: {self.precision}")
         self.model, self.tokenizer, self.smodel, self.model_size = build_model(
             precision=self.precision,
             checkpoint_path=Path(self._first_stage_ckpt),
             spk_emb_ckpt_path=Path(f"{self._model_dir}/speaker_encoder.pt"),
             device=self._device,
-            compile=True,
-            compile_prefill=True,
+            compile=False,
+            compile_prefill=False,
             quantisation_mode=quantisation_mode,
         )
         self._seed = seed

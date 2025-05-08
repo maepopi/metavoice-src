@@ -281,7 +281,6 @@ class GPT(nn.Module, NonCausalInferenceMixin, CausalInferenceMixin):
 
         x = self.transformer.drop(tok_emb + pos_emb + spk_emb)
         for block in self.transformer.h:
-            # Apply activation checkpointing
             if self.training and self.config.gradient_checkpointing:
                 x = activation_checkpoint(block, x)
             else:
